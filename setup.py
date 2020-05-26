@@ -5,6 +5,8 @@ import numpy
 import subprocess
 import os
 import builtins
+import platform
+from ctypes.util import find_library
 
 try:
     from Cython.Build import cythonize
@@ -17,13 +19,14 @@ except ImportError:
 # python setup.py build_ext --inplace
 
 # Version rutine taken from numpy
-MAJOR = 0
-MINOR = 4
-MICRO = 0
+MAJOR = 1
+MINOR = 0
+MICRO = 1
 VERSION = '%d.%d.%d' % (MAJOR, MINOR, MICRO)
 
 
 # Return the git revision as a string
+# See also ompy/version.py
 def git_version():
     def _minimal_ext_cmd(cmd):
         # construct minimal environment
@@ -70,13 +73,13 @@ def get_version_info():
     FULLVERSION = VERSION
     if os.path.exists('.git'):
         GIT_REVISION = git_version()
-    elif os.path.exists('ompy/version.py'):
+    elif os.path.exists('ompy/version_setup.py'):
         # must be a source distribution, use existing version file
         try:
             from ompy.version import git_revision as GIT_REVISION
         except ImportError:
             raise ImportError("Unable to import git_revision. Try removing "
-                              "ompy/version.py and the build directory "
+                              "ompy/version_setup.py and the build directory "
                               "before building.")
     else:
         GIT_REVISION = "Unknown"
@@ -86,10 +89,10 @@ def get_version_info():
     return FULLVERSION, GIT_REVISION
 
 
-def write_version_py(filename='ompy/version.py'):
+def write_version_py(filename='ompy/version_setup.py'):
     cnt = """
 # THIS FILE IS GENERATED FROM OMPY SETUP.PY
-#
+# State of last built is:
 short_version = '%(version)s'
 version = '%(version)s'
 full_version = '%(full_version)s'
@@ -106,24 +109,33 @@ git_revision = '%(git_revision)s'
         a.close()
 write_version_py()
 
-
-# some machines have difficulties with OpenMP
+# If macOS, use ctypes.util.find_library to determine if OpenMP is avalible.
 openmp = os.getenv("ompy_OpenMP")
-if openmp in (None, True, "True", "true"):
+if openmp is None and platform.system() == 'Darwin':  # Check if macOS
+    if find_library("omp") != None:
+        openmp = True
+        print("libOMP found, building with OpenMP")
+    else:
+        print("libOMP not found, building without OpenMP")
+elif openmp in (None, True, "True", "true"):
     openmp = True
 elif openmp in (False, "False", "false"):
     openmp = False
     print("Building without OpenMP")
 else:
     raise ValueError("Env var ompy_OpenMP must be either True or False "
-                     "(or not set); use eg. 'export ompy_OpenMP=False'")
+                     "(or not set); use eg. 'export ompy_OpenMP=False'"
+                     f"Now it is: {openmp}")
 fname = "ompy/decomposition.c"  # otherwise it may not recompile
 if os.path.exists(fname):
     os.remove(fname)
 
 extra_compile_args = ["-O3", "-ffast-math", "-march=native"]
 extra_link_args = []
-if openmp:
+if openmp and platform.system() == 'Darwin':
+    extra_compile_args.insert(-1, "-Xpreprocessor -fopenmp")
+    extra_link_args.insert(-1, "-lomp")
+elif openmp:
     extra_compile_args.insert(-1, "-fopenmp")
     extra_link_args.insert(-1, "-fopenmp")
 
@@ -137,7 +149,6 @@ ext_modules = [
                   ),
         Extension("ompy.rebin", ["ompy/rebin.pyx"], include_dirs=[numpy.get_include()]),
         Extension("ompy.gauss_smoothing", ["ompy/gauss_smoothing.pyx"], include_dirs=[numpy.get_include()]),
-        Extension("ompy.rhosig", ["ompy/rhosig.pyx"], include_dirs=[numpy.get_include()])
         ]
 
 install_requires = numpy.loadtxt("requirements.txt", dtype="str").tolist()

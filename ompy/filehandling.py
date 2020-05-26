@@ -6,16 +6,27 @@ import numpy as np
 from numpy import ndarray
 from scipy.ndimage import gaussian_filter1d
 
-# from .matrix import Matrix
 
+def mama_read(filename: str) -> Union[Tuple[ndarray, ndarray],
+                                      Tuple[ndarray, ndarray, ndarray]]:
+    """Read 1d and 2d mama spectra/matrices
 
-def mama_read(filename):
-    # Reads a MAMA matrix file and returns the matrix/vector as a numpy array,
-    # as well as a list containing the four calibration coefficients
-    # (ordered as [bx, ax, by, ay] where Ei = ai*channel_i + bi)
-    # and 1-D arrays of lower-bin-edge calibrated x and y values for plotting
-    # and similar.
-    matrix = np.genfromtxt(filename, skip_header=10, skip_footer=1,
+    Args:
+        filename (str): Filename of matrix/spectrum
+
+    Returns:
+        2 or 3 eleement tuple containing
+            - **counts** (*ndarray*): array of counts.
+            - **x_array** (*ndarray*): mid-bin energies of x axis.
+            - **y_array** (*ndarray, optional*): Returned only if input is 2d.
+                Mid-bin energies of y-axis.
+
+    Raises:
+        ValueError: If format is wrong, ie. if the calibrations line is
+            not as expected.
+
+    """
+    counts = np.genfromtxt(filename, skip_header=10, skip_footer=1,
                            encoding="latin-1")
     cal = {}
     with open(filename, 'r', encoding='latin-1') as datafile:
@@ -42,27 +53,22 @@ def mama_read(filename):
                              "Check calibration line of the Mama file")
 
     if ndim == 1:
-        Nx = matrix.shape[0]
+        Nx = counts.shape[0]
         x_array = np.linspace(0, Nx - 1, Nx)
         # Make arrays in center-bin calibration:
         x_array = cal["a0x"] + cal["a1x"] * x_array + cal["a2x"] * x_array**2
-        # Then correct them to lower-bin-edge:
-        x_array = x_array - cal["a1x"] / 2
-        # Matrix, Eg array, Ex array
-        return matrix, x_array
+        # counts, E array
+        return counts, x_array
 
     elif ndim == 2:
-        Ny, Nx = matrix.shape
+        Ny, Nx = counts.shape
         y_array = np.linspace(0, Ny - 1, Ny)
         x_array = np.linspace(0, Nx - 1, Nx)
         # Make arrays in center-bin calibration:
         x_array = cal["a0x"] + cal["a1x"] * x_array + cal["a2x"] * x_array**2
         y_array = cal["a0y"] + cal["a1y"] * y_array + cal["a2y"] * y_array**2
-        # Then correct them to lower-bin-edge:
-        y_array = y_array - cal["a1y"] / 2
-        x_array = x_array - cal["a1x"] / 2
-        # Matrix, Eg array, Ex array
-        return matrix, x_array, y_array
+        # counts, Eg array, Ex array
+        return counts, x_array, y_array
 
 
 def mama_write(mat, filename, comment=""):
@@ -87,9 +93,6 @@ def mama_write1D(mat, filename, comment=""):
         "a1x": calibration['a1'],
         "a2x": 0,
     }
-    # Convert from lower-bin-edge to centre-bin as this is what the MAMA file
-    # format is supposed to have:
-    cal["a0x"] += cal["a1x"] / 2
 
     # Write mandatory header:
     header_string = '!FILE=Disk \n'
@@ -140,14 +143,10 @@ def mama_write2D(mat, filename, comment=""):
         "a1y": calibration['a1x'],
         "a2y": 0
     }
-    # Convert from lower-bin-edge to centre-bin as this is what the MAMA file
-    # format is supposed to have:
-    cal["a0x"] += cal["a1x"] / 2
-    cal["a0y"] += cal["a1y"] / 2
 
     # Write mandatory header:
     header_string = '!FILE=Disk \n'
-    header_string += '!KIND=Spectrum \n'
+    header_string += '!KIND=Matrix \n'
     header_string += '!LABORATORY=Oslo Cyclotron Laboratory (OCL) \n'
     header_string += '!EXPERIMENT= oslo_method_python \n'
     header_string += '!COMMENT={:s} \n'.format(comment)
@@ -258,17 +257,57 @@ def load_numpy_2D(path: Union[str, Path]
     return mat[1:, 1:], mat[0, 1:], mat[1:, 0]
 
 
+def save_txt_2D(matrix: np.ndarray, Eg: np.ndarray,
+                Ex: np.ndarray, path: Union[str, Path],
+                header=None):
+    if header is None:
+        header = ("Format:\n"
+                  "     Eg0    Eg1    Eg2   ...\n"
+                  "Ex0  val00  val01  val02\n"
+                  "Ex1  val10  val11  ...\n"
+                  "Ex2  ...\n"
+                  "...")
+    elif header is False:
+        header = None
+    mat = np.empty((matrix.shape[0] + 1, matrix.shape[1] + 1))
+    mat[0, 0] = -0
+    mat[0, 1:] = Eg
+    mat[1:, 0] = Ex
+    mat[1:, 1:] = matrix
+    np.savetxt(path, mat, header=header)
+
+
+def load_txt_2D(path: Union[str, Path]
+                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mat = np.loadtxt(path)
+    return mat[1:, 1:], mat[0, 1:], mat[1:, 0]
+
+
 def load_numpy_1D(path: Union[str, Path]) -> Tuple[np.ndarray, np.ndarray]:
-    mat = np.load(path)
-    half = int(mat.shape[0] / 2)
-    return mat[:half], mat[half:]
+    vec = np.load(path)
+    E = vec[:, 0]
+    values = vec[:, 1]
+    return values, E
 
 
 def save_numpy_1D(values: np.ndarray, E: np.ndarray,
                   path: Union[str, Path]) -> None:
-    mat = np.append(values, E)
-    assert mat.size % 2 == 0
+    mat = np.column_stack((E, values))
     np.save(path, mat)
+
+
+def load_txt_1D(path: Union[str, Path]) -> Tuple[np.ndarray, np.ndarray]:
+    vec = np.loadtxt(path)
+    E = vec[:, 0]
+    values = vec[:, 1]
+    return values, E
+
+
+def save_txt_1D(values: np.ndarray, E: np.ndarray,
+                path: Union[str, Path], header='E[keV] values') -> None:
+    """ E default in keV """
+    mat = np.column_stack([E, values])
+    np.savetxt(path, mat, header=header)
 
 
 def filetype_from_suffix(path: Path) -> str:
@@ -277,27 +316,33 @@ def filetype_from_suffix(path: Path) -> str:
         return 'tar'
     elif suffix == '.npy':
         return 'numpy'
+    elif suffix == '.txt':
+        return 'txt'
     elif suffix == '.m':
         return 'mama'
     else:
-        raise ValueError(f"Unsupported filetype {suffix}")
+        return "unknown"
 
 
 def load_discrete(path: Union[str, Path], energy: ndarray,
                   resolution: float = 0.1) -> Tuple[ndarray, ndarray]:
-    """ Load discrete levels and apply smoothing
+    """Load discrete levels and apply smoothing
 
     Assumes linear equdistant binning
 
     Args:
-        path: The file to load
-        energy: The binning to use
-        resolution: The resolution to apply to the gaussian smoothing
+        path (Union[str, Path]): The file to load
+        energy (ndarray): The binning to use
+        resolution (float, optional): The resolution (FWHM) to apply to the
+            gaussian smoothing. Defaults to 0.1.
+
     Returns:
-        The binned energies and the smoothed binning
+        Tuple[ndarray, ndarray]
     """
     energies = np.loadtxt(path)
     energies /= 1e3  # convert to MeV
+    if len(energies) > 1:
+        assert energies.mean() < 5, "Probably energies are not in keV"
 
     binsize = energy[1] - energy[0]
     bin_edges = np.append(energy, energy[-1] + binsize)
@@ -306,7 +351,11 @@ def load_discrete(path: Union[str, Path], energy: ndarray,
     hist, _ = np.histogram(energies, bins=bin_edges)
     hist = hist.astype(float) / binsize  # convert to levels/MeV
 
-    smoothed = gaussian_filter1d(hist, sigma=resolution / binsize)
+    if resolution > 0:
+        resolution /= 2.3548
+        smoothed = gaussian_filter1d(hist, sigma=resolution / binsize)
+    else:
+        smoothed = None
     return hist, smoothed
 
 

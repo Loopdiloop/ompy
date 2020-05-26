@@ -1,12 +1,31 @@
 import pytest
 import ompy as om
 import numpy as np
+from numpy.testing import assert_equal
+from typing import Tuple
 
+
+def ones(shape: Tuple[int, int]) -> om.Matrix:
+    """ Creates a mock matrix with ones in the upper diagonal
+
+    A 5×5 looks like this:
+        ░░░░░░░░░░
+        ░░░░░░░░
+        ░░░░░░
+        ░░░░
+        ░░
+    Args:
+        shape: The shape of the matrix
+    Returns:
+        The matrix
+    """
+    mat = np.ones(shape)
+    mat = np.tril(mat)
+    return om.Matrix(values=mat)
 
 @pytest.fixture()
 def Si28():
     return om.example_raw('Si28')
-
 
 @pytest.mark.parametrize(
         "axis,Emin,Emax,shape",
@@ -16,7 +35,7 @@ def Si28():
          ('Eg', 1,    None, (10, 9)),
          ('Ex', 5.5,  5.5,  (1, 10))],)
 def test_cut_shape(axis, Emin, Emax, shape):
-    mat = om.ones((10, 10)).cut(axis, Emin, Emax, inplace=False)
+    mat = ones((10, 10)).cut(axis, Emin, Emax, inplace=False)
     assert mat.shape == shape
     assert len(mat.Eg) == shape[1]
     assert len(mat.Ex) == shape[0]
@@ -54,7 +73,41 @@ def test_cut_Si(Si28):
          (9.5, 20),
          (8.6, 19)])
 def test_index(E, index):
-    mat = om.ones((10, 10))
+    mat = ones((10, 10))
     mat.Ex = np.arange(-10.5, 10.5)
     assert mat.index_Ex(E) == index
+
+
+@pytest.mark.filterwarnings('ignore:divide by zero encountered in true_divide:RuntimeWarning')
+def test_numericals():
+    E = np.array([0, 1, 2])
+    values1 = np.array([[0, 1, 2.], [-2, 1, 2.],  [2, 3, -10.]])
+    matrix1 = om.Matrix(values=values1, Ex=E, Eg=E)
+
+    values2 = values1+1
+    matrix2 = om.Matrix(values=values2, Ex=E, Eg=E)
+
+    factor = 5.
+
+    for op in ("/", "*", "+", "-"):
+        eval(f"assert_equal((matrix1{op}matrix2).values, values1{op}values2)")
+        eval(f"assert_equal((matrix2{op}matrix1).values, values2{op}values1)")
+        eval(f"assert_equal((matrix1{op}factor).values, values1{op}factor)")
+        eval(f"assert_equal((factor{op}matrix1).values, factor{op}values1)")
+
+    assert_equal((matrix2@matrix1).values, values2@values1)
+    assert_equal((matrix1@matrix2).values, values1@values2)
+
+
+# This does not work as of now...
+# def test_mutable():
+#     E = np.array([0, 1, 2])
+#     E_org = E.copy()
+
+#     values = np.array([[0, 1, 2.], [-2, 1, 2.],  [2, 3, -10.]])
+#     matrix = om.Matrix(values=values, Ex=E, Eg=E)
+
+#     # chaning the Ex array shouldn't change the Eg array (due to the setter)!
+#     matrix.Ex[0] += 1
+#     assert_equal(matrix.Eg, E_org)
 

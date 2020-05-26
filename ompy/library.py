@@ -1,44 +1,11 @@
-# -*- coding: utf-8 -*-
-"""
-Library of utility classes and functions for the Oslo method.
-
----
-
-This file is part of oslo_method_python, a python implementation of the
-Oslo method.
-
-Copyright (C) 2018 Jørgen Eriksson Midtbø
-Oslo Cyclotron Laboratory
-jorgenem [0] gmail.com
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <http://www.gnu.org/licenses/>.
-
-"""
-import warnings
 import numpy as np
-import matplotlib.pyplot as plt
-from numpy import ndarray
-from .constants import DE_PARTICLE, DE_GAMMA_8MEV, DE_GAMMA_1MEV
-from matplotlib.colors import LogNorm
 from scipy.interpolate import interp1d, RectBivariateSpline
+from scipy.stats import truncnorm
 import matplotlib
 from itertools import product
-from typing import Optional, Iterable, Union, List, Tuple, Iterator
-
-import ompy as om
-
-
+from typing import Optional, Tuple, Iterator, Any, Union
+import inspect
+import re
 
 def div0(a, b):
     """ division function designed to ignore / 0, i.e. div0([-1, 0, 1], 0 ) -> [0, 0, 0] """
@@ -85,7 +52,7 @@ def E_array_from_calibration(a0: float, a1: float, *,
                              N: Optional[int] = None,
                              E_max: Optional[float] = None) -> np.ndarray:
     """
-    Return an array of lower-bin-edge energy values corresponding to the
+    Return an array of mid-bin energy values corresponding to the
     specified calibration.
 
     Args:
@@ -97,7 +64,7 @@ def E_array_from_calibration(a0: float, a1: float, *,
                  covers E_max. In other words,
                  E_array[-1] >= E_max - a1
     Returns:
-        E: Array of lower-bin-edge energy values
+        E: Array of mid-bin energy values
     """
     if E_max is not None and N is not None:
         raise ValueError("Cannot give both N and E_max -- must choose one")
@@ -111,42 +78,141 @@ def E_array_from_calibration(a0: float, a1: float, *,
         raise ValueError("Either N or E_max must be given")
 
 
-def fill_negative(matrix, window_size):
+def fill_negative_max(array: np.ndarray,
+                      window_size: Union[int, np.array]) -> np.ndarray:
     """
-    Fill negative channels with positive counts from neighbouring channels
+    Fill negative channels with positive counts from neighboring channels.
 
-    The MAMA routine for this is very complicated. It seems to basically
-    use a sliding window along the Eg axis, given by the FWHM, to look for
-    neighbouring bins with lots of counts and then take some counts from there.
-    Can we do something similar in an easy way?
+    The idea is that the negative counts are somehow connected to the (γ-ray)
+    resolution and should thus be filled from a channel within the resolution.
 
-    Todo: Debug me!
+    This implementation loops through the closest channels with maximum number
+    of counts to fill the channle(s) with negative counts. Note that it can
+    happen that some bins will remain with negative counts (if not enough bins
+    with possitive counts are available within the window_size) .
+
+    The routine is performed for each Ex row independently.
+
+    Args:
+        array: Input array, ordered as [Ex, Eg]
+        window_size (Union[int, np.array]): Window_size, eg. FWHM. If `int`
+            `float`, the same FWHM will be applied for all `Eg` bins.
+            Otherwise, provide an array with the FWHM for each `Eg` bin.
+
+    Returns:
+        array with negative counts filled, where possible
     """
-    warnings.warn("Hello from the fill_negative() function. Please debug me.")
-    matrix_out = np.copy(matrix)
-    # Loop over rows:
-    for i_Ex in range(matrix.shape[0]):
-        for i_Eg in np.where(matrix[i_Ex, :] < 0)[0]:
-            # print("i_Ex = ", i_Ex, "i_Eg =", i_Eg)
-            # window_size = 4  # Start with a constant window size.
-            # TODO relate it to FWHM by energy arrays
-            i_Eg_low = max(0, i_Eg - window_size)
-            i_Eg_high = min(matrix.shape[1], i_Eg + window_size)
-            # Fill from the channel with the larges positive count
-            # in the neighbourhood
-            i_max = np.argmax(matrix[i_Ex, i_Eg_low:i_Eg_high])
-            # print("i_max =", i_max)
-            if matrix[i_Ex, i_max] <= 0:
-                pass
-            else:
-                positive = matrix[i_Ex, i_max]
-                negative = matrix[i_Ex, i_Eg]
-                fill = min(0, positive + negative)  # Don't fill more than to 0
-                rest = positive
-                # print("fill =", fill, "rest =", rest)
-                matrix_out[i_Ex, i_Eg] = fill
-                # matrix_out[i_Ex, i_max] = rest
-    return matrix_out
+    if isinstance(window_size, int):
+        window_size = np.full(array.shape[1], window_size)
+    else:
+        assert len(window_size) == array.shape[1], "Array length incompatible"
+        assert window_size.dtype == np.integer, "Check input"
+
+    array = np.copy(array)
+    N_Ex = array.shape[0]
+    N_Eg = array.shape[1]
+    for i_Ex in range(N_Ex):
+        row = array[i_Ex, :]
+        for i_Eg in np.where(row < 0)[0]:
+            window_size_Eg = window_size[i_Eg]
+            max_distance = window_size_Eg
+            max_distance = int(np.ceil((window_size_Eg - 1) / 2))
+            i_Eg_low = max(0, i_Eg - max_distance)
+            i_Eg_high = min(N_Eg, i_Eg + max_distance)
+            while row[i_Eg] < 0:
+                i_max = np.argmax(row[i_Eg_low:i_Eg_high + 1])
+                i_max = i_Eg_low + i_max
+                if row[i_max] <= 0:
+                    break
+                shuffle_counts(row, i_max, i_Eg)
+
+    return array
+
+
+def fill_negative_gauss(array: np.ndarray, Eg: np.ndarray,
+                        window_size: Union[int, float, np.array],
+                        n_trunc: float = 3) -> np.ndarray:
+    """
+    Fill negative channels with positive counts from weighted neighbor chnls.
+
+    The idea is that the negative counts are somehow connected to the (γ-ray)
+    resolution and should thus be filled from a channel within the resolution.
+
+    This implementation loops through channels with the maximum "weight", where
+    the weight is given by
+        weight = gaussian(i, loc=i, scale ~ window_size) * counts(i),
+    to fill the channle(s) with negative counts. Note that it can
+    happen that some bins will remain with negative counts (if not enough bins
+    with possitive counts are available within the window_size) .
+
+    The routine is performed for each Ex row independently.
+
+    Args:
+        array: Input array, ordered as [Ex, Eg]
+        Eg: Gamma-ray energies
+        window_size: FWHM for the gaussian. If `int` or
+            `float`, the same FWHM will be applied for all `Eg` bins.
+            Otherwise, provide an array with the FWHM for each `Eg` bin.
+        n_trun (float, optional): Truncate gaussian for faster calculation.
+            Defaults to 3.
+
+    Returns:
+        array with negative counts filled, where possible
+    """
+    if isinstance(window_size, (int, float)):
+        window_size = np.full(array.shape[1], window_size)
+        sigma = window_size/2.355  # convert FWHM to sigma
+    else:
+        assert len(window_size) == array.shape[1], "Array length incompatible"
+        sigma = window_size/2.355  # convert FWHM to sigma
+
+    # generate truncated gauss for each Eg bin, format [Eg-bin, gauss-values]
+    lower, upper = Eg - n_trunc*sigma, Eg + n_trunc*sigma
+    a = (lower - Eg) / sigma
+    b = (upper - Eg) / sigma
+    gauss = [truncnorm(a=a, b=b, loc=p, scale=sig).pdf(Eg)
+             for p, sig in zip(Eg, sigma)]
+    gauss = np.array(gauss)
+
+    array = np.copy(array)
+    N_Ex = array.shape[0]
+    for i_Ex in range(N_Ex):
+        row = array[i_Ex, :]
+        for i_Eg in np.nonzero(row < 0)[0]:
+            positives = np.where(row < 0, 0, row)
+            weights = positives * gauss[i_Eg, :]
+
+            for i_from in np.argsort(weights):
+                if row[i_from] < 0:
+                    break
+                shuffle_counts(row, i_from, i_Eg)
+                if row[i_Eg] >= 0:
+                    break
+
+    return array
+
+
+def shuffle_counts(row: np.ndarray, i_from: int, i_to: int):
+    """Shuffles counts in `row` from bin `i_from` to `i_to`
+
+    Transfers at maximum row[i_from] counts, so that row[i_from] cannot be
+    negative after the shuffling.
+
+    Note:
+        Assumes that row[i_from] > 0 and row[i_to] < 0.
+
+    Args:
+        row: Input array
+        i_from: Index of bin to take counts from
+        i_to: Index of bin to fill
+
+    """
+    positive = row[i_from]
+    negative = row[i_to]
+    fill = min(0, positive + negative)
+    rest = max(0, positive + negative)
+    row[i_to] = fill
+    row[i_from] = rest
 
 
 def cut_diagonal(matrix, Ex_array, Eg_array, E1, E2):
@@ -229,7 +295,7 @@ def log_interp1d(xx, yy, **kwargs):
     """ Interpolate a 1-D function.logarithmically """
     logy = np.log(yy)
     lin_interp = interp1d(xx, logy, kind='linear', **kwargs)
-    log_interp = lambda zz: np.exp(lin_interp(zz))
+    log_interp = lambda zz: np.exp(lin_interp(zz))  # noqa
     return log_interp
 
 
@@ -238,110 +304,11 @@ def call_model(fun,pars,pars_req):
 
     # Check if required parameters are a subset of all pars given
     if pars_req <= set(pars):
-        return fun(**pars)
+        pcall = {p: pars[p] for p in pars_req}
+        return fun(**pcall)
     else:
-        raise TypeError("Error: Need following arguments for this method: {0}".format(pars_req))
-
-
-def tranform_nld_gsf(samples: dict, nld=None, gsf=None,
-                     N_max: int = 100,
-                     random_state=np.random.RandomState(65489)):
-    """
-    Use a list(dict) of samples of `A`, `B`, and `alpha` parameters from
-    multinest to transform a (list of) nld and/or gsf sample(s). Can be used
-    to normalize the nld and/or gsf
-
-    Args:
-        samples (dict): Multinest samples.
-        nld (om.Vector or list/array[om.Vector], optional):
-            nld ("unnormalized")
-        gsf (om.Vector or list/array[om.Vector], optional):
-            gsf ("unnormalized")
-        N_max (int, optional): Maximum number of samples returned if `nld`
-                               and `gsf` is a list/array
-        random_state (optional): random state, set by default such that
-                                 a repeted use of the function gives the same
-                                 results.
-
-    Returns:
-        `nld_trans` and/or `gsf_trans`: Transformed `nld` and or `gsf`,
-                                        depending on what input is given.
-
-    """
-
-    # Need to sweep though multinest samples in random order
-    # as they are ordered with decreasing likelihood by default
-    for key, value in samples.items():
-        N_multinest = len(value)
-        break
-    randlist = np.arange(N_multinest)
-    random_state.shuffle(randlist)  # works in-place
-
-    if nld is not None:
-        A = samples["A"]
-        alpha = samples["alpha"]
-        if type(nld) is om.Vector:
-            N = min(N_multinest, N_max)
-        else:
-            N = len(nld)
-        nld_trans = []
-
-    if gsf is not None:
-        B = samples["B"]
-        alpha = samples["alpha"]
-        if type(gsf) is om.Vector:
-            N = min(N_multinest, N_max)
-        else:
-            N = len(gsf)
-        gsf_trans = []
-
-    # transform the list
-    for i in range(N):
-        i_multi = randlist[i]
-        # nld loop
-        try:
-            if type(nld) is om.Vector:
-                nld_tmp = nld
-            else:
-                nld_tmp = nld[i]
-            nld_tmp = nld_tmp.transform(alpha=alpha[i_multi],
-                                        const=A[i_multi])
-            nld_trans.append(nld_tmp)
-        except:
-            pass
-        # gsf loop
-        try:
-            if type(gsf) is om.Vector:
-                gsf_tmp = gsf
-            else:
-                gsf_tmp = gsf[i]
-            gsf_tmp = gsf_tmp.transform(alpha=alpha[i_multi],
-                                        const=B[i_multi])
-            gsf_trans.append(gsf_tmp)
-        except:
-            pass
-
-    if nld is not None and gsf is not None:
-        return nld_trans, gsf_trans
-    elif gsf is not None:
-        return gsf_trans
-    elif nld is not None:
-        return nld_trans
-
-
-def diagonal_resolution(Ex: np.ndarray) -> np.ndarray:
-    """ Calculate Ex-dependent detector resolution (sum of sqroot)
-    Args:
-        Ex: Excitation energy bin array
-    """
-    # Assume constant particle resolution:
-    dE_particle = DE_PARTICLE
-    # Interpolate the gamma resolution linearly:
-    dE_gamma = ((DE_GAMMA_8MEV - DE_GAMMA_1MEV) / (8000 - 1000)
-                * (Ex - 1000)) + DE_GAMMA_1MEV
-
-    dE_resolution = np.sqrt(dE_particle**2 + dE_gamma**2)
-    return dE_resolution
+        raise TypeError("Error: Need following arguments for this method:"
+                        " {0}".format(pars_req))
 
 
 def annotate_heatmap(im, matrix, valfmt="{x:.2f}",
@@ -415,3 +382,49 @@ def diagonal_elements(matrix: np.ndarray) -> Iterator[Tuple[int, int]]:
             if col != 0.0:
                 yield i, Ny-j
                 break
+
+
+def self_if_none(instance: Any, variable: Any, nonable: bool = False) -> Any:
+    """ Sets `variable` from instance if variable is None.
+
+    Note: Has to be imported as in the normalizer class due to class stack
+          name retrieval
+
+    Args:
+        instance: instance
+        variable: The variable to check
+        nonable: Does not raise ValueError if
+            variable is None.
+    Returns:
+        The value of variable or instance.variable
+    Raises:
+        ValueError if both variable and
+        self.variable are None.
+    """
+    name = _retrieve_name(variable)
+    if variable is None:
+        self_variable = getattr(instance, name)
+        if not nonable and self_variable is None:
+            raise ValueError(f"`{name}` must be set")
+        return self_variable
+    return variable
+
+
+def _retrieve_name(var: Any) -> str:
+    """ Finds the source-code name of `var`
+
+        NOTE: Only call from self.reset.
+
+     Args:
+        var: The variable to retrieve the name of.
+    Returns:
+        The variable's name.
+    """
+    # Retrieve the line of the source code of the third frame.
+    # The 0th frame is the current function, the 1st frame is the
+    # calling function and the second is the calling function's caller.
+    line = inspect.stack()[3].code_context[0].strip()
+    match = re.search(r".*\((\w+).*\).*", line)
+    assert match is not None, "Retrieving of name failed"
+    name = match.group(1)
+    return name
